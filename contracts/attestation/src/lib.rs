@@ -54,7 +54,7 @@ pub use dispute::{
     Dispute, DisputeOutcome, DisputeResolution, DisputeStatus, DisputeType, OptionalResolution,
 };
 pub use dynamic_fees::{compute_fee, DataKey, FeeConfig};
-pub use events::{AttestationMigratedEvent, AttestationRevokedEvent, AttestationSubmittedEvent};
+pub use events::{AttestationMigratedEvent, AttestationRevokedEvent, AttestationSubmittedEvent, ProofHashUpdatedEvent};
 pub use fees::{collect_flat_fee, FlatFeeConfig};
 pub use multisig::{Proposal, ProposalAction, ProposalStatus};
 pub use rate_limit::RateLimitConfig;
@@ -92,6 +92,14 @@ pub struct BatchAttestationItem {
     pub expiry_timestamp: Option<u64>,
 }
 
+/// Maximum number of items allowed in a single batch submission.
+///
+/// The O(n²) duplicate scan and per-item auth checks mean cost grows
+/// quadratically. At 25 items the validation loop executes at most
+/// 25 × 25 = 625 comparisons — well within Soroban's CPU budget while
+/// still covering all practical bulk-submission use cases.
+pub const MAX_BATCH_SIZE: u32 = 25;
+
 #[contract]
 pub struct AttestationContract;
 
@@ -102,11 +110,12 @@ fn compare_strings(a: &String, b: &String) -> Ordering {
 
 #[contractimpl]
 impl AttestationContract {
-    pub fn initialize(env: Env, admin: Address, _nonce: u64) {
+    pub fn initialize(env: Env, admin: Address, nonce: u64) {
         if dynamic_fees::is_initialized(&env) {
             panic!("already initialized");
         }
         admin.require_auth();
+        replay_protection::verify_and_increment_nonce(&env, &admin, NONCE_CHANNEL_ADMIN, nonce);
         dynamic_fees::set_admin(&env, &admin);
         access_control::grant_role(&env, &admin, ROLE_ADMIN, &admin);
     }
@@ -208,12 +217,18 @@ impl AttestationContract {
         merkle_root: BytesN<32>,
         timestamp: u64,
         version: u32,
-        _fee_paid: i128, // legacy argument, preserved for signature compatibility
+        _fee_paid: i128,
         proof_hash: Option<BytesN<32>>,
         expiry_timestamp: Option<u64>,
     ) {
         access_control::require_not_paused(&env);
         business.require_auth();
+
+        // Enforce period validation check
+        Self::validate_period(&period);
+
+        // Keep the main branch rate limit check intact
+        rate_limit::check_rate_limit(&env, &business);
 
         let key = DataKey::Attestation(business.clone(), period.clone());
         if env.storage().instance().has(&key) {
@@ -257,11 +272,17 @@ impl AttestationContract {
         if items.is_empty() {
             panic!("batch cannot be empty");
         }
+        if items.len() > MAX_BATCH_SIZE {
+            panic!("batch exceeds maximum size");
+        }
 
         // 1. Validation Phase
         let mut seen = Vec::new(&env);
         let mut authed_businesses = Vec::new(&env);
         for item in items.iter() {
+            // Enforce non-empty period validation inside batch pipelines
+            Self::validate_period(&item.period);
+
             // Only require_auth once per unique business in the batch
             let mut already_authed = false;
             for b in authed_businesses.iter() {
@@ -482,7 +503,28 @@ impl AttestationContract {
             .get(&key)
             .expect("attestation not found");
 
-        let data: AttestationData = (
+        let data = (
+            old_root.clone(),
+            timestamp,
+            old_ver,
+            fee,
+            proof_hash.clone(),
+            expiry,
+        );
+        assert!(
+            new_version > old_ver,
+            "new version must be greater than old version"
+        );
+        assert!(
+            !Self::attestation_expired(&env, &data),
+            "cannot migrate an expired attestation"
+        );
+        assert!(
+            !dispute::is_attestation_revoked(&env, &business, &period),
+            "cannot migrate a revoked attestation"
+        );
+
+        let new_data: AttestationData = (
             new_merkle_root.clone(),
             timestamp,
             new_version,
@@ -490,7 +532,7 @@ impl AttestationContract {
             proof_hash,
             expiry,
         );
-        env.storage().instance().set(&key, &data);
+        env.storage().instance().set(&key, &new_data);
 
         events::emit_attestation_migrated(
             &env,
@@ -501,6 +543,49 @@ impl AttestationContract {
             old_ver,
             new_version,
             &caller,
+        );
+    }
+
+    pub fn extend_expiry(
+        env: Env,
+        business: Address,
+        period: String,
+        new_expiry: u64,
+    ) {
+        business.require_auth();
+
+        let key = DataKey::Attestation(business.clone(), period.clone());
+        let (merkle_root, timestamp, version, fee, proof_hash, old_expiry): AttestationData = env
+            .storage()
+            .instance()
+            .get(&key)
+            .expect("attestation not found");
+
+        let current_expiry = old_expiry.unwrap_or(0);
+        if new_expiry <= current_expiry {
+            panic!("new_expiry must be greater than current expiry");
+        }
+        if new_expiry <= timestamp {
+            panic!("new_expiry must be greater than attestation timestamp");
+        }
+
+        let data: AttestationData = (
+            merkle_root,
+            timestamp,
+            version,
+            fee,
+            proof_hash.clone(),
+            Some(new_expiry),
+        );
+        env.storage().instance().set(&key, &data);
+
+        events::emit_proof_hash_updated(
+            &env,
+            &business,
+            &period,
+            &proof_hash,
+            &proof_hash,
+            &business,
         );
     }
 
@@ -592,8 +677,30 @@ impl AttestationContract {
         env.storage().instance().set(&key, &updated);
     }
 
+    /// Admin: set the DAO contract address for dynamic fee config override.
+    pub fn set_dao(env: Env, dao: Address) {
+        dynamic_fees::require_admin(&env);
+        dynamic_fees::set_dao(&env, &dao);
+    }
+
+    /// Admin: set the DAO contract address for flat fee config override.
+    pub fn set_flat_fee_dao(env: Env, dao: Address) {
+        dynamic_fees::require_admin(&env);
+        fees::set_dao(&env, &dao);
+    }
+
+    /// Returns the locally stored dynamic fee config (ignores DAO).
+    pub fn get_fee_config(env: Env) -> Option<FeeConfig> {
+        dynamic_fees::get_fee_config(&env)
+    }
+
     pub fn get_flat_fee_config(env: Env) -> Option<FlatFeeConfig> {
         fees::get_flat_fee_config(&env)
+    }
+
+    /// Returns the effective flat fee config (DAO override takes precedence).
+    pub fn get_effective_flat_fee_config(env: Env) -> Option<FlatFeeConfig> {
+        fees::get_effective_flat_fee_config(&env)
     }
 
     pub fn get_fee_quote(env: Env, business: Address) -> i128 {
@@ -608,8 +715,38 @@ impl AttestationContract {
         dynamic_fees::get_admin(&env)
     }
 
-    pub fn get_submission_burst_count(env: Env, business: Address) -> u32 {
+    pub fn get_submission_window_count(env: Env, business: Address) -> u32 {
         rate_limit::get_submission_count(&env, &business)
+    }
+
+    pub fn get_submission_burst_count(env: Env, business: Address) -> u32 {
+        rate_limit::get_burst_submission_count(&env, &business)
+    }
+
+    pub fn get_rate_limit_config(env: Env) -> Option<RateLimitConfig> {
+        rate_limit::get_rate_limit_config(&env)
+    }
+
+    pub fn configure_rate_limit(
+        env: Env,
+        max_submissions: u32,
+        window_seconds: u64,
+        burst_max_submissions: u32,
+        burst_window_seconds: u64,
+        enabled: bool,
+        nonce: u64,
+    ) {
+        let admin = dynamic_fees::get_admin(&env);
+        admin.require_auth();
+        replay_protection::verify_and_increment_nonce(&env, &admin, NONCE_CHANNEL_ADMIN, nonce);
+        let config = RateLimitConfig {
+            max_submissions,
+            window_seconds,
+            burst_max_submissions,
+            burst_window_seconds,
+            enabled,
+        };
+        rate_limit::set_rate_limit_config(&env, &config);
     }
 
     pub fn configure_key_rotation(
@@ -729,6 +866,40 @@ impl AttestationContract {
         dispute::get_dispute(&env, dispute_id)
     }
 
+    /// Return all dispute IDs associated with a specific attestation.
+    pub fn get_disputes_by_attestation(
+        env: Env,
+        business: Address,
+        period: String,
+    ) -> Vec<u64> {
+        dispute::get_dispute_ids_by_attestation(&env, &business, &period)
+    }
+
+    /// Return all dispute IDs opened by a specific challenger.
+    pub fn get_disputes_by_challenger(env: Env, challenger: Address) -> Vec<u64> {
+        dispute::get_dispute_ids_by_challenger(&env, &challenger)
+    }
+
+    /// Revoke an attestation.
+    pub fn revoke_attestation(
+        env: Env,
+        caller: Address,
+        business: Address,
+        period: String,
+        reason: String,
+        _nonce: u64,
+    ) {
+        dispute::require_revocation_authorized(&env, &caller, &business, &period);
+        let revocation: RevocationData = (caller.clone(), env.ledger().timestamp(), reason.clone());
+        dispute::record_revocation(&env, &business, &period, &revocation);
+        events::emit_attestation_revoked(&env, &business, &period, &caller, &reason);
+    }
+
+    /// Return `true` when the attestation has been revoked.
+    pub fn is_revoked(env: Env, business: Address, period: String) -> bool {
+        dispute::is_attestation_revoked(&env, &business, &period)
+    }
+
     pub fn register_business(
         env: Env,
         business: Address,
@@ -829,6 +1000,17 @@ impl AttestationContract {
 
     // ── Internal Helpers ──────────────────────────────────────────────
 
+    /// REQUIREMENT: Rejects empty or malformed strings to avoid permanent unvalidated storage poisoning.
+    fn validate_period(period: &String) {
+        if period.len() == 0 {
+            panic!("period string must not be empty");
+        }
+
+        if period.len() != 6 {
+            panic!("malformed period string structure: expected YYYYMM format");
+        }
+    }
+
     fn validate_expiry(env: &Env, timestamp: u64, expiry_timestamp: Option<u64>) {
         if let Some(expiry) = expiry_timestamp {
             if expiry <= timestamp {
@@ -852,4 +1034,8 @@ impl AttestationContract {
 #[cfg(test)]
 mod batch_submission_test;
 #[cfg(test)]
+mod tier_bounds_test;
+#[cfg(test)]
 mod test;
+#[cfg(test)]
+mod verify_attestation_test;
