@@ -881,6 +881,26 @@ impl AttestationContract {
     }
 
     /// Revoke an attestation.
+    ///
+    /// The caller must be the business owner or hold the ADMIN role.
+    /// Delegates all authorization and idempotency checks to
+    /// [`dispute::require_revocation_authorized`], then atomically writes
+    /// the revocation record, updates the per-business index, and increments
+    /// the global revocation sequence counter via [`dispute::record_revocation`].
+    ///
+    /// # Parameters
+    /// - `caller`  — address authorizing the revocation (admin or business owner)
+    /// - `business` — business whose attestation is being revoked
+    /// - `period`   — period string identifying the attestation
+    /// - `reason`   — human-readable revocation reason stored on-chain
+    /// - `_nonce`   — legacy replay-protection argument (ignored; preserved for
+    ///                 signature compatibility with off-chain tooling)
+    ///
+    /// # Panics
+    /// - Contract is paused
+    /// - Attestation does not exist
+    /// - Attestation is already revoked
+    /// - Caller is neither the business owner nor an admin
     pub fn revoke_attestation(
         env: Env,
         caller: Address,
@@ -896,6 +916,9 @@ impl AttestationContract {
     }
 
     /// Return `true` when the attestation has been revoked.
+    ///
+    /// This is a thin public wrapper around [`dispute::is_attestation_revoked`]
+    /// so callers do not need to go through the dispute module directly.
     pub fn is_revoked(env: Env, business: Address, period: String) -> bool {
         dispute::is_attestation_revoked(&env, &business, &period)
     }
